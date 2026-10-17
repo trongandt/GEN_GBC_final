@@ -12,7 +12,6 @@ Phase 1 training additionally requires `torch-geometric`.
 ```bash
 pip install torch
 pip install torch-geometric  # only for training Phase 1
-OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
 ```
 
 Use the existing CPU PyTorch in Colab. No GPU is required. Each module has
@@ -119,11 +118,12 @@ or overlap supervision to Phase 1.
 
 ## Validation and experimental limits
 
-The regression suite covers misleading proxies, strict exact improvement,
+Development checks covered misleading proxies, strict exact improvement,
 budgets, unique labels/elite rows, stable holdout, independent shortest-path
 enumeration, and end-to-end Phase 2 with real C++ exact/HEDGE backends on a
 small graph. It also checks saturated budgets and saved artifacts.
 
+The development test folder is not included in this repository/package.
 These checks establish implementation behavior; they do not establish a
 gain over CentRA on SNAP graphs. Compare the parent baseline and this version
 on ca-grqc k=10 first, then p2p-gnutella08 and lastfm-asia, using multiple seeds
