@@ -15,11 +15,10 @@ pip install torch-geometric  # only for training Phase 1
 OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
 ```
 
-Use the existing CPU PyTorch in Colab. No GPU is required. Importable entry
-points `dataset_builder.py`, `phase2_trajectory.py`, and `value_net.py` load
-their numbered source files. Keep both when cloning. Existing Colab cells
-that download a numbered source to its standard module name still work;
-also download the new `candidate_archive.py` and updated `neighbor.py`.
+Use the existing CPU PyTorch in Colab. No GPU is required. Each module has
+one canonical source file: `dataset_builder.py`, `phase2_trajectory.py`, and
+`value_net.py`. Numbered duplicate files have been removed. Upload all Python
+modules, including `candidate_archive.py` and `neighbor.py`, together.
 
 ## Run from Phase 1 outputs
 
