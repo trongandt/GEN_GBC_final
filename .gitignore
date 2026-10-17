@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+experiments/
+*_phase2
+*.pt
+.pytest_cache/

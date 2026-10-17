@@ -82,6 +82,9 @@ class TrajectoryStep:
 @dataclass
 class Trajectory:
     steps: list[TrajectoryStep] = field(default_factory=list)
+    evaluations: list[TrajectoryStep] = field(default_factory=list)
+    audit: list[dict] = field(default_factory=list)
+    stop_reason: str = ''
 
     def append(self, step):
         self.steps.append(step)
@@ -471,15 +474,117 @@ def build_trajectory(S_init, h_v: Tensor, V_phi, H: int = 5,
     return traj
 
 
+def build_verified_trajectory(S_init, h_v, V_phi, scorer, *, H=5,
+                              bc_raw=None, expert_nodes=(), per_source=2,
+                              random_per_node=1, shortlist_size=8,
+                              exploration_slots=2, max_batches_per_step=2,
+                              evaluation_budget=64, seed=42, h_G=None,
+                              improvement_rtol=1e-10, improvement_atol=1e-8):
+    """ValueNet ranks proposals; exact GBC alone accepts a trajectory step.
+
+    Budget counts distinct candidate sets verified within this trajectory,
+    including cache hits (but excluding the initial set). A failed shortlist
+    is not a certificate of local optimality. Audits are recorded before any
+    subsequent model fit, allowing honest prequential ranking diagnostics.
+    """
+    from neighbor import propose_mixed_neighbors
+    if (H < 0 or shortlist_size < 1 or evaluation_budget < 0 or
+            not 0 <= exploration_slots < shortlist_size or max_batches_per_step < 1):
+        raise ValueError('Invalid verified-search budget/shortlist')
+    score = float(scorer.score_many([S_init])[0])
+    traj = Trajectory([TrajectoryStep(S_init, score, True)])
+    visited, checked = {S_init.nodes}, 0
+    rng = random.Random(seed)
+    for iteration in range(H):
+        if checked >= evaluation_budget:
+            traj.stop_reason = 'evaluation_budget'
+            break
+        current = traj.terminal
+        candidates = [c for c in propose_mixed_neighbors(
+            current.S, h_v, bc_raw=bc_raw, expert_nodes=expert_nodes,
+            per_source=per_source, random_per_node=random_per_node,
+            seed=seed+iteration) if c.seed_set.nodes not in visited]
+        if not candidates:
+            traj.stop_reason = 'no_unvisited_proposals'
+            break
+        predicted = V_phi.predict_batch(h_v, [c.seed_set for c in candidates], h_G)
+        current_proxy = V_phi.predict(h_v, current.S, h_G)
+        if (not math.isfinite(current_proxy) or len(predicted) != len(candidates)
+                or any(not math.isfinite(v) for v in predicted)):
+            raise ValueError('Invalid ValueNet candidate predictions')
+        pending = sorted(range(len(candidates)), key=lambda i:
+                         (-predicted[i], tuple(sorted(candidates[i].seed_set.nodes))))
+        accepted = None
+        for batch in range(max_batches_per_step):
+            take = min(shortlist_size, evaluation_budget-checked, len(pending))
+            if take <= 0:
+                break
+            explore = min(exploration_slots, max(0, take-1))
+            selected = pending[:take-explore]
+            tail = [i for i in pending if i not in selected]
+            # Prefer moves from seed positions not already represented.
+            represented = {candidates[i].removed for i in selected}
+            rng.shuffle(tail)
+            tail.sort(key=lambda i: candidates[i].removed in represented)
+            selected += tail[:explore]
+            selected_set = set(selected)
+            pending = [i for i in pending if i not in selected_set]
+            values = scorer.score_many([candidates[i].seed_set for i in selected])
+            if len(values) != len(selected):
+                raise ValueError('Exact scorer returned an incomplete batch')
+            for i, exact in zip(selected, values):
+                c, exact = candidates[i], float(exact)
+                if not math.isfinite(exact) or exact < 0:
+                    raise ValueError('Invalid exact score')
+                checked += 1
+                visited.add(c.seed_set.nodes)
+                obs = TrajectoryStep(c.seed_set, exact, True)
+                traj.evaluations.append(obs)
+                tol = improvement_atol+improvement_rtol*abs(current.score)
+                improves = exact > current.score+tol
+                traj.audit.append(dict(iteration=iteration, batch=batch,
+                    nodes=sorted(c.seed_set.nodes), removed=c.removed, added=c.added,
+                    source=c.source, predicted_score=float(predicted[i]),
+                    predicted_delta=float(predicted[i]-current_proxy),
+                    exact_score=exact, exact_delta=exact-current.score,
+                    exact_improves=improves, accepted=False))
+                if improves and (accepted is None or exact > accepted.score):
+                    accepted = obs
+            if accepted is not None:
+                for record in traj.audit:
+                    if record['iteration'] == iteration:
+                        record['accepted'] = record['nodes'] == sorted(accepted.S.nodes)
+                traj.append(accepted)
+                break
+        if accepted is None:
+            traj.stop_reason = ('evaluation_budget' if checked >= evaluation_budget
+                                else 'no_improvement_in_verified_shortlists')
+            break
+    if not traj.stop_reason:
+        traj.stop_reason = 'max_steps'
+    return traj
+
+
 def build_all_trajectories(graph, k: int, h_v: Tensor, V_phi, *,
                            seed_sets_override: dict, H: int = 5, k_neighbors: int = 5,
-                           h_G=None, early_stop=True, endpoint_weight=1., midpoint_weight=.3):
+                           h_G=None, early_stop=True, endpoint_weight=1., midpoint_weight=.3,
+                           scorer=None, verified_options=None, update_callback=None):
     _validate_graph(graph, k)
     dataset = TrajectoryDataset(endpoint_weight=endpoint_weight, midpoint_weight=midpoint_weight)
     for i, (name, S) in enumerate(seed_sets_override.items(), 1):
         validate_seed_set(S, graph.num_nodes, k)
-        traj = build_trajectory(S, h_v, V_phi, H, k_neighbors, h_G, early_stop)
+        if scorer is None:
+            traj = build_trajectory(S, h_v, V_phi, H, k_neighbors, h_G, early_stop)
+        else:
+            options = dict(verified_options or {})
+            options['seed'] = options.get('seed', 42)+i*100
+            traj = build_verified_trajectory(S, h_v, V_phi, scorer, H=H,
+                                             h_G=h_G, **options)
         dataset.add(traj, name)
+        if update_callback is not None:
+            update_callback(i, dataset)
         print(f"[Phase2B] {i}/{len(seed_sets_override)} {name}: steps={traj.length}, "
-              f"proxy_raw={traj.initial.score:.6f}->{traj.terminal.score:.6f}", flush=True)
+              f"{'exact' if scorer is not None else 'proxy'}_raw="
+              f"{traj.initial.score:.6f}->{traj.terminal.score:.6f}; "
+              f"stop={traj.stop_reason}", flush=True)
     return dataset

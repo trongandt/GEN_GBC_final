@@ -253,14 +253,22 @@ class ValueNetTrainer:
         pred = self.model(h_S_batch, h_G_batch)
         res = (pred - y).square()
         ss = (y - y.mean()).square().sum()
+        pairs = torch.triu_indices(len(y), len(y), offset=1, device=self.device)
+        truth = (y[pairs[0]]-y[pairs[1]]).sign()
+        ordering = (pred[pairs[0]]-pred[pairs[1]]).sign()
+        valid = truth != 0
         return dict(mse=res.mean().item(), mae=(pred-y).abs().mean().item(),
-                    r2=1-res.sum().item()/ss.item() if ss > 0 else 0.)
+                    r2=1-res.sum().item()/ss.item() if ss > 0 else 0.,
+                    ranking_pairs=int(valid.sum()),
+                    pairwise_accuracy=float((truth[valid] == ordering[valid]).float().mean())
+                    if bool(valid.any()) else None)
 
     def save(self, path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(dict(model_state=self.model.state_dict(),
                         optimizer_state=self.optimizer.state_dict(),
                         train_config=asdict(self.config), fit_calls=self.fit_calls,
+                        archive_training_anchor=getattr(self, '_archive_training_anchor', None),
                         model_config=dict(embed_dim=self.model.embed_dim,
                                           hidden_dims=self.model.hidden_dims,
                                           use_context=self.model.use_context,
@@ -272,4 +280,6 @@ class ValueNetTrainer:
         self.config = TrainConfig(**ckpt['train_config'])
         self.optimizer.load_state_dict(ckpt['optimizer_state'])
         self.fit_calls = ckpt.get('fit_calls', 0)
+        if ckpt.get('archive_training_anchor') is not None:
+            self._archive_training_anchor = tuple(ckpt['archive_training_anchor'])
         self.model.eval()

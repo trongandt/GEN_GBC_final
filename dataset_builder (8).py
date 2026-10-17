@@ -1,11 +1,11 @@
-"""GEN-GBC Phase 2A -> B -> C+D -> B+ -> elite, runnable on Phase 1 outputs.
+"""Verified GEN-GBC Phase 2 search, exact archive and unique generative data.
 
-ExactGBCScorer supplies all ground truth. Midpoints retain raw ValueNet soft
-labels even when the same set also occurs as an endpoint, as in GEN-CIM. Repeated source
-rows stay separate, preserving their original endpoint/midpoint weights.
+ValueNet ranks mixed proposals; exact scores accept moves. The exact training
+archive includes rejected proposals while Dcand retains quality and diversity.
+Trajectory edges are serialized separately from canonical candidate rows.
 """
 from __future__ import annotations
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 import argparse
 import hashlib
@@ -25,6 +25,7 @@ from phase2_trajectory import (SeedSet, Trajectory, TrajectoryDataset, ALWAYS_KE
                                init_seed_sets, quality_filter, build_all_trajectories)
 from value_net import (ValueNetwork, ValueNetTrainer, TrainConfig,
                        compute_seed_embedding_batch)
+from candidate_archive import CandidateArchive
 
 
 @dataclass(frozen=True)
@@ -66,12 +67,12 @@ def build_dataset(graph, trajectories: list[Trajectory], scorer, strategy_names=
         for i, step in enumerate(traj):
             endpoint = i in (0, len(traj)-1)
             key = frozenset(step.S.nodes)
-            verified = endpoint or not use_proxy_for_midpoints
+            verified = key in scorer.cache
             score = float(scorer.cache[key]) if verified else float(step.score)
-            # Keep midpoint soft labels and weights exactly as in GEN-CIM.
+            # An available exact label takes precedence in every occurrence.
             step.score, step.is_exact_verified = score, verified
             samples.append(DataSample(step.S, score,
-                                      endpoint_weight if endpoint else midpoint_weight,
+                                      endpoint_weight if verified else midpoint_weight,
                                       verified, ti, i, name))
     print(f"[Phase2C+D] D_traj={len(samples)} rows, "
           f"exact={sum(s.is_exact_verified for s in samples)}, "
@@ -112,6 +113,21 @@ class Phase2Config:
     H: int = 5
     k_neighbors: int = 5
     early_stop: bool = True
+    verified_search: bool = True
+    proposal_per_source: int = 2
+    random_per_node: int = 1
+    shortlist_size: int = 8
+    exploration_slots: int = 2
+    max_batches_per_step: int = 2
+    trajectory_evaluation_budget: int = 64
+    improvement_rtol: float = 1e-10
+    improvement_atol: float = 1e-8
+    online_every_trajectories: int = 3
+    online_epochs: int = 50
+    candidate_quality_ratio: float = .95
+    candidate_max_size: int = 256
+    candidate_min_distance: int = 1
+    validation_ratio: float = .2
     # Original adaptive gate, with the user-required STRICT qualification.
     quality_floor: float = 1.
     quality_ratio: float = .5
@@ -159,6 +175,20 @@ class Phase2Config:
     centra_initial_samples: int = 512
 
     def validate(self):
+        new_counts = (self.proposal_per_source, self.random_per_node, self.shortlist_size,
+                      self.exploration_slots, self.max_batches_per_step,
+                      self.trajectory_evaluation_budget, self.online_every_trajectories,
+                      self.online_epochs, self.candidate_max_size, self.candidate_min_distance)
+        if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in new_counts):
+            raise ValueError('Search/archive counts must be nonnegative integers')
+        if (self.proposal_per_source < 1 or self.shortlist_size < 1 or
+                self.max_batches_per_step < 1 or self.candidate_max_size < 1 or
+                not 0 <= self.exploration_slots < self.shortlist_size or
+                not 0 <= self.candidate_quality_ratio <= 1 or
+                not 0 <= self.validation_ratio < 1 or
+                not math.isfinite(self.improvement_rtol) or self.improvement_rtol < 0 or
+                not math.isfinite(self.improvement_atol) or self.improvement_atol < 0):
+            raise ValueError('Invalid verified-search/archive configuration')
         if not 0 < self.hedge_epsilon < 1-1/math.e:
             raise ValueError("Invalid HEDGE epsilon")
         if self.hedge_seeds_per_budget < 1:
@@ -330,11 +360,60 @@ def add_elite_buffer(samples, config: Phase2Config):
         weights = [cfg.elite_weight*math.exp((s.score-top[0].score)/cfg.soft_weight_temp)
                    for s in top]
         weights = [max(1e-12, w) for w in weights]
-    next_idx = max((s.trajectory_idx for s in samples), default=-1)+1
-    elite = [DataSample(s.seed_set, s.score, w, True, next_idx+i, 0, f'elite_{s.strategy}')
-             for i, (s, w) in enumerate(zip(top, weights))]
+    boosts = {s.seed_set.nodes: w for s, w in zip(top, weights)}
+    # Upgrade a canonical row instead of appending duplicate elite examples.
+    samples = [replace(s, weight=s.weight+boosts.get(s.seed_set.nodes, 0.)) for s in samples]
+    elite = [s for s in samples if s.seed_set.nodes in boosts]
     print(f"[Elite] {len(elite)} unique exact sets; weights={weights}.", flush=True)
-    return samples+elite, elite
+    return samples, elite
+
+
+def canonicalize_samples(samples, cache):
+    """One row per set; exact overrides proxy, duplicate weights never sum."""
+    rows = {}
+    for s in samples:
+        key = s.seed_set.nodes
+        if key in cache:
+            s = replace(s, score=float(cache[key]), is_exact_verified=True,
+                        weight=max(1., s.weight))
+        old = rows.get(key)
+        if old is None or (s.is_exact_verified, s.weight) > (old.is_exact_verified, old.weight):
+            rows[key] = s
+    return list(rows.values())
+
+
+def archive_samples(archive):
+    return [DataSample(r.seed_set, r.exact_score, 1., True, -1, -1,
+                       '|'.join(sorted(r.sources))) for r in archive.exact_records]
+
+
+def fit_archive(trainer, archive, h_v, h_G, cfg, *, epochs, stage):
+    """Stable set-level holdout excluded from bootstrap and every later fit.
+
+    Search adaptively uses exact scores, so this diagnostic is not an
+    independent final test set. Prequential audits complement it.
+    """
+    rows = archive_samples(archive)
+    if not rows:
+        return dict(stage=stage, train_sets=0, validation_sets=0)
+    if not hasattr(trainer, '_archive_training_anchor'):
+        trainer._archive_training_anchor = min(tuple(sorted(s.seed_set.nodes)) for s in rows)
+    def held_out(s):
+        key = tuple(sorted(s.seed_set.nodes))
+        digest = hashlib.sha256((str(cfg.seed)+':'+','.join(map(str, key))).encode()).hexdigest()
+        return key != trainer._archive_training_anchor and int(digest, 16)/2**256 < cfg.validation_ratio
+    validation = [s for s in rows if held_out(s)]
+    training = [s for s in rows if not held_out(s)]
+    x, y, w = samples_to_tensors(training, h_v)
+    trainer.config.epochs = epochs
+    trainer.fit(x, y, w, h_G_batch=h_G if cfg.use_context else None)
+    report = dict(stage=stage, train_sets=len(training), validation_sets=len(validation),
+                  validation_scope='never_fitted_but_adaptive_search_not_independent_test',
+                  validation_nodes=[sorted(s.seed_set.nodes) for s in validation])
+    if validation:
+        vx, vy, _ = samples_to_tensors(validation, h_v)
+        report.update(trainer.evaluate(vx, vy, h_G if cfg.use_context else None))
+    return report
 
 
 def _sample_record(sample):
@@ -360,11 +439,27 @@ class Phase2Result:
     graph_fingerprint: str
     initialization_audit: dict = field(default_factory=dict)
     timings: dict = field(default_factory=dict)
+    archive: CandidateArchive = field(default_factory=CandidateArchive)
+    value_net_metrics: list[dict] = field(default_factory=list)
+
+    @property
+    def best_exact(self):
+        return self.archive.best
 
     def save(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        payload = dict(samples=[_sample_record(s) for s in self.samples],
+        row_index = {s.seed_set.nodes: i for i, s in enumerate(self.samples)}
+        edges = sorted({(row_index[a.S.nodes], row_index[b.S.nodes])
+                        for traj in self.trajectory_dataset.trajectories
+                        for a, b in zip(traj.steps, traj.steps[1:])
+                        if a.S.nodes in row_index and b.S.nodes in row_index})
+        payload = dict(schema_version=2, samples=[_sample_record(s) for s in self.samples],
+                       trajectory_edges=[list(edge) for edge in edges],
+                       candidate_archive=self.archive.to_records(),
+                       best_exact=(dict(nodes=sorted(self.best_exact.seed_set.nodes),
+                                        score=self.best_exact.exact_score) if self.best_exact else None),
+                       value_net_metrics=self.value_net_metrics,
                        exact_cache=[dict(nodes=sorted(key), score=sc) for key, sc in self.cache.items()],
                        pair_cache=[dict(nodes=sorted(key), score=sc) for key, sc in self.pair_cache.items()],
                        h_G=self.h_G.detach().cpu(), graph_fingerprint=self.graph_fingerprint,
@@ -372,7 +467,8 @@ class Phase2Result:
                        config=asdict(self.config), Ffloor=self.Ffloor,
                        initial_experts={name: sorted(s.nodes) for name, s in self.initial_experts.items()},
                        kept_experts=list(self.kept_experts), expert_scores=self.expert_scores,
-                       trajectories=[dict(strategy=name, steps=[dict(nodes=sorted(s.S.nodes),
+                       trajectories=[dict(strategy=name, stop_reason=traj.stop_reason,
+                                     audit=traj.audit, steps=[dict(nodes=sorted(s.S.nodes),
                                      score=s.score, is_exact_verified=s.is_exact_verified) for s in traj])
                                      for name, traj in zip(self.trajectory_dataset.strategy_names,
                                                            self.trajectory_dataset.trajectories)],
@@ -392,12 +488,10 @@ def run_phase2(graph: GraphData, h_v: Tensor, bc_raw: Optional[Tensor] = None, *
                config: Optional[Phase2Config] = None, scorer=None, graph_path=None,
                exact_source=None, exact_binary=None, centra_source=None, centra_binary=None,
                centra_nodes=None, checkpoint_dir=None, device=None) -> Phase2Result:
-    """No Phase 1 changes needed: pass run_phase1(..., return_labels=True).
+    """Pass run_phase1(..., return_labels=True); no Phase 1 changes required.
 
-    Orchestration follows inspected GEN-CIM source: bootstrap,
-    surrogate-only trajectories, exact endpoints, retrain, B+, elite.
-    Both B+ branches are ON by default per the user's GEN-GBC configuration.
-    B+/elite rows feed Phase 3; the source does NOT retrain ValueNet after B+.
+    Verified search is the default. All exact observations train ValueNet;
+    only quality/diversity-selected unique candidates enter generative data.
     """
     from exact_gbc_scorer import ExactGBCScorer, compile_exact_gbc
     cfg = config or Phase2Config()
@@ -471,31 +565,76 @@ def run_phase2(graph: GraphData, h_v: Tensor, bc_raw: Optional[Tensor] = None, *
                             rank_pairs_per_batch=cfg.rank_pairs_per_batch, seed=cfg.seed)
     trainer = ValueNetTrainer(model, train_cfg, dev)
     t = time.perf_counter()
-    # Phase 2A bootstrap on EXACT labels of quality-filtered experts.
-    boot_x = compute_seed_embedding_batch(h_v, list(kept.values()))
-    boot_y = torch.tensor(list(kept_labels.values()), dtype=torch.float64, device=dev)
-    trainer.fit(boot_x, boot_y, h_G_batch=h_G if cfg.use_context else None)
-    print(f"[Phase2A] ValueNet bootstrapped on {len(kept)} retained expert sources.", flush=True)
+    # Keep all paid-for exact labels, including HEDGE trials not chosen as experts.
+    archive = CandidateArchive()
+    for name, S in initial.items():
+        archive.add(S, all_scores[name], exact=True, source=name)
+    for row in initialization_audit.get('hedge_candidates', []):
+        archive.add(SeedSet(row['nodes']), row['exact_score'], exact=True,
+                    source='hedge_trial_'+str(row['seed']))
+    metrics = [fit_archive(trainer, archive, h_v, h_G, cfg,
+                           epochs=cfg.bootstrap_epochs, stage='bootstrap')]
+    print(f"[Phase2A] ValueNet bootstrap: {metrics[-1]['train_sets']} unique training sets.", flush=True)
     times['bootstrap_training_seconds'] = time.perf_counter()-t
     t = time.perf_counter()
+    def update_from_search(index, dataset):
+        for name, traj in zip(dataset.strategy_names, dataset.trajectories):
+            for step in list(traj)+traj.evaluations:
+                if step.S.nodes in scorer.cache:
+                    archive.add(step.S, scorer.cache[step.S.nodes], exact=True, source=name)
+        if (cfg.online_every_trajectories and cfg.online_epochs and
+                index % cfg.online_every_trajectories == 0):
+            metrics.append(fit_archive(trainer, archive, h_v, h_G, cfg,
+                                       epochs=cfg.online_epochs, stage=f'online_{index}'))
+    search_options = dict(bc_raw=bc_raw,
+        expert_nodes=sorted(set().union(*(s.nodes for s in initial.values()))),
+        per_source=cfg.proposal_per_source, random_per_node=cfg.random_per_node,
+        shortlist_size=cfg.shortlist_size, exploration_slots=cfg.exploration_slots,
+        max_batches_per_step=cfg.max_batches_per_step,
+        evaluation_budget=cfg.trajectory_evaluation_budget, seed=cfg.seed,
+        improvement_rtol=cfg.improvement_rtol, improvement_atol=cfg.improvement_atol)
     trajectories = build_all_trajectories(graph, cfg.k, h_v, model, seed_sets_override=kept,
                                           H=cfg.H, k_neighbors=cfg.k_neighbors, h_G=h_G,
                                           early_stop=cfg.early_stop,
                                           endpoint_weight=cfg.endpoint_weight,
-                                          midpoint_weight=cfg.midpoint_weight)
-    times['surrogate_trajectory_seconds'] = time.perf_counter()-t
+                                          midpoint_weight=cfg.midpoint_weight,
+                                          scorer=scorer if cfg.verified_search else None,
+                                          verified_options=search_options,
+                                          update_callback=update_from_search)
+    times['trajectory_and_online_training_seconds'] = time.perf_counter()-t
     t = time.perf_counter()
     samples, cache = build_dataset_from_trajectory_dataset(graph, trajectories, scorer)
+    # Endpoints verified in the legacy path also enter the exact archive.
+    for s in samples:
+        archive.add(s.seed_set, s.score, exact=s.is_exact_verified,
+                    source=s.strategy, confidence_weight=s.weight)
+    samples = canonicalize_samples(samples+archive_samples(archive), cache)
     times['exact_stage_c_dataset_seconds'] = time.perf_counter()-t
-    x, y, w = samples_to_tensors(samples, h_v)
-    trainer.config.epochs = cfg.retrain_epochs
     t = time.perf_counter()
-    trainer.fit(x, y, w, h_G_batch=h_G if cfg.use_context else None)
+    metrics.append(fit_archive(trainer, archive, h_v, h_G, cfg,
+                               epochs=cfg.retrain_epochs, stage='after_trajectories'))
     times['retraining_seconds'] = time.perf_counter()-t
     t = time.perf_counter()
     samples, _ = augment_endpoint_neighborhood(
         samples, graph, h_v, scorer, cfg, reference_set=initial['centra'])
+    # Retain every B+ evaluation for ValueNet, including rejected proposals.
+    # Existing sample rows supply precise provenance; cache-only rows are rejects.
+    for s in samples:
+        archive.add(s.seed_set, s.score, exact=s.is_exact_verified,
+                    source=s.strategy, confidence_weight=s.weight)
+    for key, score in cache.items():
+        archive.add(SeedSet(key), score, exact=True,
+                    source='bplus_evaluated' if key not in archive.records else '')
+    selected = archive.select(quality_ratio=cfg.candidate_quality_ratio,
+                              max_size=cfg.candidate_max_size,
+                              min_distance=cfg.candidate_min_distance)
+    # Distinct singleton IDs prevent old consumers grouping all canonical rows
+    # into one artificial trajectory. New consumers should use trajectory_edges.
+    samples = [DataSample(r.seed_set, r.exact_score, cfg.endpoint_weight, True, i, 0,
+                          '|'.join(sorted(r.sources))) for i, r in enumerate(selected)]
     samples, _ = add_elite_buffer(samples, cfg)
+    metrics.append(fit_archive(trainer, archive, h_v, h_G, cfg,
+                               epochs=cfg.retrain_epochs, stage='after_bplus'))
     times['augmentation_and_elite_seconds'] = time.perf_counter()-t
     times['total_phase2_seconds'] = time.perf_counter()-start
     fingerprint = hashlib.sha256(json.dumps(dict(n=graph.num_nodes, directed=graph.directed,
@@ -503,12 +642,21 @@ def run_phase2(graph: GraphData, h_v: Tensor, bc_raw: Optional[Tensor] = None, *
                        separators=(',', ':')).encode()).hexdigest()
     result = Phase2Result(samples, cache, h_G, model, trainer, trajectories, initial, kept,
                           all_scores, floor, {}, cfg,
-                          fingerprint, initialization_audit=initialization_audit, timings=times)
+                          fingerprint, initialization_audit=initialization_audit, timings=times,
+                          archive=archive, value_net_metrics=metrics)
+    if archive.best.exact_score < max(all_scores.values()):
+        raise AssertionError('Best expert was lost from exact archive')
+    audits = [row for traj in trajectories.trajectories for row in traj.audit]
+    diagnostics = dict(stage='prequential_search', evaluated_moves=len(audits),
+        predicted_improvements=sum(row['predicted_delta'] > 0 for row in audits),
+        false_improvements=sum(row['predicted_delta'] > 0 and not row['exact_improves'] for row in audits))
+    metrics.append(diagnostics)
     if checkpoint_dir is not None:
         result.save(checkpoint_dir)
         torch.save(bc_raw.detach().cpu(), Path(checkpoint_dir)/'bc_raw.pt')
     print(f"[Phase2] Xong sau {times['total_phase2_seconds']:.1f}s; "
-          f"best exact={best_sample(samples).score:.6f}; samples={len(samples)}.", flush=True)
+          f"best exact={archive.best.exact_score:.6f}; unique Dcand={len(samples)}; "
+          f"exact archive={len(archive.exact_records)}.", flush=True)
     return result
 
 
@@ -531,6 +679,12 @@ def _main():
                         help='B+ crossover is ON by default; --no-crossover disables it')
     parser.add_argument('--quality-floor', type=float, default=1.)
     parser.add_argument('--quality-ratio', type=float, default=.5)
+    parser.add_argument('--verified-search', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--shortlist-size', type=int, default=8)
+    parser.add_argument('--exploration-slots', type=int, default=2)
+    parser.add_argument('--trajectory-evaluation-budget', type=int, default=64)
+    parser.add_argument('--candidate-quality-ratio', type=float, default=.95)
+    parser.add_argument('--candidate-max-size', type=int, default=256)
     parser.add_argument('--hedge-epsilon', type=float, default=.1)
     parser.add_argument('--centra-nodes', help='JSON ARRAY of INTERNAL IDs from SAME graph (optional)')
     args = parser.parse_args()
@@ -540,6 +694,11 @@ def _main():
     bc = torch.load(args.bc_raw, map_location='cpu', weights_only=True) if args.bc_raw else None
     nodes = json.loads(Path(args.centra_nodes).read_text()) if args.centra_nodes else None
     cfg = Phase2Config(k=args.k, seed=args.seed, exact_threads=args.threads,
+                        verified_search=args.verified_search,
+                        shortlist_size=args.shortlist_size, exploration_slots=args.exploration_slots,
+                        trajectory_evaluation_budget=args.trajectory_evaluation_budget,
+                        candidate_quality_ratio=args.candidate_quality_ratio,
+                        candidate_max_size=args.candidate_max_size,
                         hedge_epsilon=args.hedge_epsilon,
                         perturb_sampling=args.perturb, crossover=args.crossover,
                         quality_floor=args.quality_floor, quality_ratio=args.quality_ratio)
